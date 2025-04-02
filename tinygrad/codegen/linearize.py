@@ -5,8 +5,13 @@ from tinygrad.ops import UOp, Ops, PatternMatcher, UPat, graph_rewrite, GroupOp
 from tinygrad.spec import type_verify
 from tinygrad.dtype import dtypes, PtrDType
 from tinygrad.helpers import dedup, flatten, partition
+from tinygrad.renderer import OptOps
 
 DONT_PLACE_IN_BLOCK = {Ops.NAME, Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.CONST, *GroupOp.Block}
+
+def has_grouptop_opt(uops) -> bool:
+  """Check if any operation in the list uses GROUPTOP optimization"""
+  return any(getattr(getattr(u, "op", None), "name", "") == "GROUPTOP" for u in uops)
 
 def disp(y:UOp) -> str:
   if y.op is Ops.BLOCKSTART: return "w"+disp(y.src[0])
@@ -27,6 +32,8 @@ class BasicBlock:
 def append_to_block(ctx:tuple[dict[UOp, tuple[UOp, ...]], dict[UOp, list[UOp]]], x:UOp):
   block_ctxs, children = ctx
   in_this_block = set(x.arg.lst)
+  
+  has_grouptop = has_grouptop_opt(in_this_block)
 
   # collections to build
   new_srcs: list[UOp] = []
@@ -41,6 +48,10 @@ def append_to_block(ctx:tuple[dict[UOp, tuple[UOp, ...]], dict[UOp, list[UOp]]],
         # merge sibling blocks. NOTE: blocks must only have one output source
         assert u.arg.ctx not in old_blocks, "sibling should never have been created"
         old_blocks[u.arg.ctx] = u
+    elif u.op is Ops.CONST and has_grouptop and set(children[u]).issubset(in_this_block):
+      if u not in seen_u:
+        new_srcs.extend(u.src)
+        to_append.append(u)
     elif u.op not in DONT_PLACE_IN_BLOCK and set(children[u]).issubset(in_this_block):
       if u not in seen_u:
         # if it can go in blocks and all its children are in the block, we add it to the block
@@ -181,6 +192,8 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
   # get children and all block contexts
   temp_block_ctxs: dict[UOp, list[UOp]] = {}
   children: dict[UOp, list[UOp]] = {}
+  has_grouptop = has_grouptop_opt(sink.toposort)
+  
   for u in sink.toposort:
     this_block_ctx: list[UOp] = []
     for s in u.src:
@@ -188,6 +201,8 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
       children.setdefault(s, []).append(u)
       # compute block ctx
       if s.op in {Ops.RANGE, Ops.IF}: this_block_ctx.append(s)
+      elif s.op is Ops.CONST and has_grouptop:
+        this_block_ctx += temp_block_ctxs.get(s, [])
       # don't flow (fully) through assign and store
       elif s.op is Ops.STORE:
         # ugh, deal with non-reduce locals. probably wrong
